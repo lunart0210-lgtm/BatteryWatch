@@ -1,6 +1,7 @@
 """Источники данных для /opt/stocks/stocks.py.
 
-  * stooq_candles(symbol) — дневная история акций/ETF со Stooq (без ключа).
+  * stooq_candles(symbol) — дневная история акций/ETF: Yahoo chart API
+    (без ключа), запасной — Stooq (нужен STOOQ_API_KEY в .env).
     Возвращает словарь в формате Finnhub stock/candle: {'s': 'ok', 'c': [...]},
     поэтому заменяет вызов finnhub_get('stock/candle', ...) один к одному.
   * cmc_quotes(symbols)   — котировки крипты с CoinMarketCap (бесплатный Basic).
@@ -67,7 +68,37 @@ def _ny_today():
     return dt.datetime.now(NY).date() if NY else dt.datetime.utcnow().date()
 
 
-# ---------------------------------------------------------------- Stooq
+# ------------------------------------------------- дневная история акций
+# Stooq с 2025 отдаёт CSV только с apikey (вместо данных — HTML-страница),
+# поэтому основной источник — Yahoo chart API (без ключа), Stooq — запасной.
+
+YAHOO_URL = 'https://query1.finance.yahoo.com/v8/finance/chart/'
+
+
+def yahoo_daily(symbol, days=HISTORY_DAYS):
+    """[(date, close), ...] от старых к новым."""
+    code, text = _http_get(YAHOO_URL + urllib.parse.quote(symbol.strip().upper().replace('.', '-')),
+                           {'range': '3mo' if days > 31 else '1mo', 'interval': '1d'}, UA)
+    try:
+        body = json.loads(text)
+    except ValueError:
+        raise RuntimeError('yahoo HTTP %s: %s' % (code, text[:60].replace('\n', ' ')))
+    chart = body.get('chart') or {}
+    if code != 200 or chart.get('error') or not chart.get('result'):
+        raise RuntimeError('yahoo HTTP %s: %s' % (code, (chart.get('error') or {}).get('description')))
+    res = chart['result'][0]
+    stamps = res.get('timestamp') or []
+    closes = ((res.get('indicators') or {}).get('quote') or [{}])[0].get('close') or []
+    rows = []
+    for ts, c in zip(stamps, closes):
+        if c is None:
+            continue
+        d = dt.datetime.fromtimestamp(ts, NY).date() if NY else dt.datetime.utcfromtimestamp(ts).date()
+        rows.append((d, float(c)))
+    rows.sort()
+    # одна запись на дату (последняя)
+    return list(dict(rows).items())
+
 
 def stooq_symbol(symbol):
     s = symbol.strip()
@@ -78,7 +109,7 @@ def stooq_symbol(symbol):
 
 
 def stooq_daily(symbol, days=HISTORY_DAYS):
-    """[(date, close), ...] от старых к новым. Пустой список, если данных нет."""
+    """[(date, close), ...] от старых к новым. Работает, если Stooq снова отдаёт CSV."""
     today = _ny_today()
     params = {
         's': stooq_symbol(symbol),
@@ -86,13 +117,15 @@ def stooq_daily(symbol, days=HISTORY_DAYS):
         'd1': (today - dt.timedelta(days=days)).strftime('%Y%m%d'),
         'd2': today.strftime('%Y%m%d'),
     }
+    key = _env('STOOQ_API_KEY')
+    if key:
+        params['apikey'] = key
     code, text = _http_get(STOOQ_URL, params, UA)
     if code != 200:
         raise RuntimeError('stooq HTTP %s' % code)
     text = text.strip()
     if not text.lower().startswith('date'):
-        # "No data" или сообщение о превышении дневного лимита
-        raise RuntimeError('stooq: ' + text[:80].replace('\n', ' '))
+        raise RuntimeError('stooq: не CSV (%s)' % text[:40].replace('\n', ' '))
     rows = []
     for row in csv.DictReader(io.StringIO(text)):
         try:
@@ -103,17 +136,30 @@ def stooq_daily(symbol, days=HISTORY_DAYS):
     return rows
 
 
+def daily_closes(symbol):
+    """Пробует источники по очереди, первый успешный выигрывает."""
+    errors = []
+    for name, fn in (('yahoo', yahoo_daily), ('stooq', stooq_daily)):
+        try:
+            rows = fn(symbol)
+            if rows:
+                return name, rows
+            errors.append(name + ': пусто')
+        except Exception as e:
+            errors.append(str(e))
+    raise RuntimeError('; '.join(errors))
+
+
 def stooq_candles(symbol, **_ignored):
-    """Замена finnhub_get('stock/candle', ...).
+    """Замена finnhub_get('stock/candle', ...). Имя оставлено ради совместимости
+    с уже пропатченным stocks.py; источник — daily_closes().
 
     Как и у Finnhub, последний элемент 'c' — это «сегодня»: в stocks.py он
     отбрасывается через candles['c'][:-1]. Если сегодняшней свечи ещё нет
     (до открытия биржи, выходные), подставляем последнее закрытие как
     заглушку, чтобы [:-1] срезал её, а не вчерашний завершённый день.
     """
-    rows = stooq_daily(symbol)
-    if not rows:
-        return {'s': 'no_data'}
+    _, rows = daily_closes(symbol)
     closes = [c for _, c in rows]
     if rows[-1][0] < _ny_today():
         closes.append(closes[-1])
@@ -189,8 +235,9 @@ if __name__ == '__main__':
     if kind == 'stock':
         for s in symbols:
             try:
+                src, _ = daily_closes(s)
                 hist = stooq_candles(s)['c'][:-1]
-                print('%-6s stooq: %d дней, последнее закрытие %.2f, мин. за 10 дней %.2f'
+                print('%-6s ' + src + ': %d дней, последнее закрытие %.2f, мин. за 10 дней %.2f'
                       % (s, len(hist), hist[-1], min(hist[-10:])))
             except Exception as e:
                 print('%-6s stooq ОШИБКА: %s' % (s, e))
