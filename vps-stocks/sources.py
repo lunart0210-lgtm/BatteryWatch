@@ -6,6 +6,8 @@
   * cmc_quotes(symbols)   — котировки крипты с CoinMarketCap (бесплатный Basic).
     Один запрос на все монеты; отдаёт цену и изменения за 24ч / 7д / 30д.
 
+Только стандартная библиотека (urllib), как и в самом stocks.py.
+
 Проверка на VPS:  venv/bin/python sources.py stock ABBV SLV
                   venv/bin/python sources.py crypto BTC ETH
 """
@@ -15,9 +17,11 @@ import io
 import logging
 import os
 import pathlib
+import json
 import time
-
-import requests
+import urllib.error
+import urllib.parse
+import urllib.request
 
 try:
     from zoneinfo import ZoneInfo
@@ -49,6 +53,16 @@ def _env(name):
     return None
 
 
+def _http_get(url, params, headers):
+    """(status, text). HTTP-ошибки не бросает — CMC кладёт описание в тело."""
+    req = urllib.request.Request(url + '?' + urllib.parse.urlencode(params), headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
+            return r.status, r.read().decode('utf-8', 'replace')
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode('utf-8', 'replace')
+
+
 def _ny_today():
     return dt.datetime.now(NY).date() if NY else dt.datetime.utcnow().date()
 
@@ -72,9 +86,10 @@ def stooq_daily(symbol, days=HISTORY_DAYS):
         'd1': (today - dt.timedelta(days=days)).strftime('%Y%m%d'),
         'd2': today.strftime('%Y%m%d'),
     }
-    r = requests.get(STOOQ_URL, params=params, headers=UA, timeout=TIMEOUT)
-    r.raise_for_status()
-    text = r.text.strip()
+    code, text = _http_get(STOOQ_URL, params, UA)
+    if code != 200:
+        raise RuntimeError('stooq HTTP %s' % code)
+    text = text.strip()
     if not text.lower().startswith('date'):
         # "No data" или сообщение о превышении дневного лимита
         raise RuntimeError('stooq: ' + text[:80].replace('\n', ' '))
@@ -127,16 +142,18 @@ def cmc_quotes(symbols):
         by_cmc.setdefault(cmc_symbol(s), []).append(s)
     if not by_cmc:
         return {}
-    r = requests.get(
+    code, text = _http_get(
         CMC_URL,
-        params={'symbol': ','.join(by_cmc), 'convert': 'USD', 'skip_invalid': 'true'},
-        headers={'X-CMC_PRO_API_KEY': key, 'Accept': 'application/json'},
-        timeout=TIMEOUT,
+        {'symbol': ','.join(by_cmc), 'convert': 'USD', 'skip_invalid': 'true'},
+        {'X-CMC_PRO_API_KEY': key, 'Accept': 'application/json'},
     )
-    body = r.json()
+    try:
+        body = json.loads(text)
+    except ValueError:
+        raise RuntimeError('CMC %s: %s' % (code, text[:80]))
     status = body.get('status') or {}
-    if r.status_code != 200 or status.get('error_code'):
-        raise RuntimeError('CMC %s: %s' % (r.status_code, status.get('error_message')))
+    if code != 200 or status.get('error_code'):
+        raise RuntimeError('CMC %s: %s' % (code, status.get('error_message')))
 
     out = {}
     for cmc_sym, entries in (body.get('data') or {}).items():
