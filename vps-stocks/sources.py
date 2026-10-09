@@ -237,10 +237,10 @@ if __name__ == '__main__':
             try:
                 src, _ = daily_closes(s)
                 hist = stooq_candles(s)['c'][:-1]
-                print('%-6s ' + src + ': %d дней, последнее закрытие %.2f, мин. за 10 дней %.2f'
-                      % (s, len(hist), hist[-1], min(hist[-10:])))
+                print('%-6s %s: %d дней, последнее закрытие %.2f, мин. за 10 дней %.2f'
+                      % (s, src, len(hist), hist[-1], min(hist[-10:])))
             except Exception as e:
-                print('%-6s stooq ОШИБКА: %s' % (s, e))
+                print('%-6s ОШИБКА: %s' % (s, e))
             time.sleep(0.5)
     else:
         try:
